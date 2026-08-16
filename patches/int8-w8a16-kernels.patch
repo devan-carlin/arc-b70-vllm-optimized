@@ -1,0 +1,295 @@
+diff --git a/csrc/xpu/onednn/int8_gemm_w8a16.h b/csrc/xpu/onednn/int8_gemm_w8a16.h
+new file mode 100644
+index 0000000..4591c65
+--- /dev/null
++++ b/csrc/xpu/onednn/int8_gemm_w8a16.h
+@@ -0,0 +1,133 @@
++#pragma once
++
++#include <c10/xpu/XPUStream.h>
++#include <torch/torch.h>
++
++#include <dnnl.hpp>
++
++#include "onednn_ext.h"
++#include "onednn_runtime.h"
++
++namespace oneDNN {
++
++// INT8 W8A16 GEMM: bf16/f16 activations x int8 (s8) weights, symmetric
++// group-quantized (no zero point).
++//
++//   result = (mat1 @ mat2^T) * scale + bias
++//
++//   mat1  : src, [b, m, k]  bf16/f16
++//   mat2  : quantized weight, [k, n] s8 (1 byte per weight, no packing),
++//           passed as the transpose of a contiguous [n, k] tensor so that k
++//           is the contiguous (stride-1) dimension (trans_type_t::nt).
++//   m2_sc : weight scale, [k/group_size, n] bf16 (group quant along k,
++//           per-channel along n).
++//
++// This mirrors dnnl_matmul_w4a16_int4 but with s8 weights (no packing, no
++// zero point).
++static inline void dnnl_matmul_w8a16_int8(
++    torch::Tensor& result,      // dst, [b, m, n]
++    const torch::Tensor& mat1,  // src, [b, m, k]
++    const torch::Tensor& mat2,  // quantized weight, [k, n] transpose
++    const std::optional<torch::Tensor>& bias,
++    const torch::Tensor& m2_sc,  // [k/group_size, n]
++    const int64_t group_size) {
++  auto src_sz = mat1.sizes();
++  auto o_sz = result.sizes();
++
++  const int m = std::reduce(
++      src_sz.begin(), src_sz.end() - 1, 1, std::multiplies<int64_t>());
++  const int n = o_sz.back();  // presume channel last format
++  const int k = *(src_sz.end() - 1);
++
++  // get joint dtypes
++  joint_dtypes_t jd;
++  auto in_dtype = mat1.scalar_type();
++  if (in_dtype == at::ScalarType::Half) {
++    jd = joint_dtypes_t::f16_int8;
++  } else if (in_dtype == at::ScalarType::BFloat16) {
++    jd = joint_dtypes_t::bf16_int8;
++  } else {
++    TORCH_INTERNAL_ASSERT(
++        false, "Unsupported data type for int8 matmul: ", mat1.scalar_type());
++  }
++
++  // get bias type
++  bias_type_t b_type = get_bias_type(bias, m, n);
++
++  // get lda ldb and ldc
++  auto mat1_strides = mat1.strides();
++  int64_t leading_dim = -1;
++  if (mat1.dim() == 2) {
++    leading_dim = 0;
++  } else if (mat1.dim() == 3) {
++    leading_dim = mat1_strides[0] < mat1_strides[1] ? 0 : 1;
++  } else {
++    TORCH_CHECK(
++        false, "Unsupported input dimension for int8 matmul: ", mat1.dim());
++  }
++  int64_t lda = mat1_strides[leading_dim];
++  int64_t ldb = mat2.strides()[mat2.dim() - 1] == 1
++                    ? mat2.strides()[mat2.dim() - 2]
++                    : mat2.strides()[mat2.dim() - 1];
++  int64_t ldc = result.strides()[leading_dim];
++
++  auto f_attr = [&](dnnl::primitive_attr& pattr) {
++    pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
++    // group quant along k (one scale per group_size), per-channel along n.
++    pattr.set_scales(
++        DNNL_ARG_WEIGHTS,
++        /* mask */ (1 << 0) + (1 << 1),
++        {group_size, 1},
++        get_onednn_dtype(m2_sc));
++  };
++
++  // ************************************************************
++  // get device, engine, stream
++  const int dev_id = c10::xpu::getCurrentXPUStream().device_index();
++  at::Device curDevice = at::Device(at::kXPU, dev_id);
++  auto engine = GpuEngineManager::Instance().get_engine(curDevice);
++
++  auto& matmul_ext = matmul_primitive_create_and_cache(
++      jd,
++      trans_type_t::nt,
++      b_type,
++      m,
++      n,
++      k,
++      lda,
++      ldb,
++      ldc,
++      dev_id,
++      f_attr,
++      group_size);
++
++  int arg_off = 0;
++  // set scale for matmul args
++  matmul_ext.set_attribute(
++      arg_off++,
++      DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
++      m2_sc.data_ptr(),
++      [&]() {
++        return make_onednn_memory(
++            get_onednn_md(m2_sc), engine, m2_sc.data_ptr());
++      });
++
++  // set general args
++  std::vector<std::pair<int, void*>> arg_handles;
++  arg_handles.reserve(8);
++
++  arg_handles.emplace_back(DNNL_ARG_SRC, mat1.data_ptr());
++  arg_handles.emplace_back(DNNL_ARG_WEIGHTS, mat2.data_ptr());
++  arg_handles.emplace_back(DNNL_ARG_DST, result.data_ptr());
++  if (get_shape(b_type) != bias_shape_t::none) {
++    arg_handles.emplace_back(DNNL_ARG_BIAS, bias.value().data_ptr());
++  }
++  int scratchpad_size = matmul_ext.get_scratchpad_size();
++  torch::Tensor scratchpad_tensor = at::empty(
++      {scratchpad_size}, mat1.options().dtype(at::kByte), c10::nullopt);
++  arg_handles.emplace_back(DNNL_ARG_SCRATCHPAD, scratchpad_tensor.data_ptr());
++
++  auto& strm = GpuStreamManager::Instance().get_stream();
++  matmul_ext.execute(strm, engine, std::move(arg_handles), arg_off);
++}
++}  // namespace oneDNN
+diff --git a/csrc/xpu/onednn/onednn_ext.h b/csrc/xpu/onednn/onednn_ext.h
+index 9a29844..4bc0fab 100644
+--- a/csrc/xpu/onednn/onednn_ext.h
++++ b/csrc/xpu/onednn/onednn_ext.h
+@@ -53,6 +53,8 @@ enum class joint_dtypes_t {
+   f8_e4m3_bf16,
+   mxfp4_bf16,
+   mxfp4_f16,
++  f16_int8,
++  bf16_int8,
+ };
+ 
+ template <joint_dtypes_t Ts>
+@@ -220,6 +222,28 @@ struct onednn_types_mapper<joint_dtypes_t::mxfp4_f16> {
+   }
+ };
+ 
++template <>
++struct onednn_types_mapper<joint_dtypes_t::f16_int8> {
++  static inline std::
++      tuple<memory::data_type, memory::data_type, memory::data_type>
++      get() {
++    return std::make_tuple(
++        memory::data_type::f16, memory::data_type::s8, memory::data_type::f16);
++  }
++};
++
++template <>
++struct onednn_types_mapper<joint_dtypes_t::bf16_int8> {
++  static inline std::
++      tuple<memory::data_type, memory::data_type, memory::data_type>
++      get() {
++    return std::make_tuple(
++        memory::data_type::bf16,
++        memory::data_type::s8,
++        memory::data_type::bf16);
++  }
++};
++
+ static inline memory::data_type
+ get_onednn_dtype(const at::Tensor& tensor, bool allow_undef = false) {
+   switch (tensor.scalar_type()) {
+@@ -1168,6 +1192,36 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
+           scale_group_size,
+           zp_group_size,
+           batch_dim);
++    case joint_dtypes_t::f16_int8:
++      return matmul_primitive_create_and_cache<joint_dtypes_t::f16_int8, F>(
++          Tt,
++          b_type,
++          m,
++          n,
++          k,
++          lda,
++          ldb,
++          ldc,
++          device_id,
++          attr,
++          scale_group_size,
++          zp_group_size,
++          batch_dim);
++    case joint_dtypes_t::bf16_int8:
++      return matmul_primitive_create_and_cache<joint_dtypes_t::bf16_int8, F>(
++          Tt,
++          b_type,
++          m,
++          n,
++          k,
++          lda,
++          ldb,
++          ldc,
++          device_id,
++          attr,
++          scale_group_size,
++          zp_group_size,
++          batch_dim);
+     default:
+       throw std::runtime_error("Only support int4 and fp8 gemm ...");
+   }
+diff --git a/csrc/xpu/onednn/onednn_matmul.cpp b/csrc/xpu/onednn/onednn_matmul.cpp
+index 734308a..28dfc5b 100644
+--- a/csrc/xpu/onednn/onednn_matmul.cpp
++++ b/csrc/xpu/onednn/onednn_matmul.cpp
+@@ -4,6 +4,7 @@
+ #include "fp8_gemm_w8a16.h"
+ #include "int4_gemm_w4a16.h"
+ #include "int4_gemm_w4a8.h"
++#include "int8_gemm_w8a16.h"
+ 
+ inline bool is_supported_fp8(at::ScalarType t) {
+   return (t == at::ScalarType::Float8_e5m2) ||
+@@ -217,6 +218,30 @@ torch::Tensor int4_gemm_w4a16(
+   return result;
+ }
+ 
++torch::Tensor int8_gemm_w8a16(
++    const torch::Tensor& A,  // src, [b, m, k] bf16/f16
++    const torch::Tensor& B,  // quantized weight, [k, n] s8
++    const std::optional<torch::Tensor>& bias,
++    const torch::Tensor& B_scale,  // [k/group_size, n] bf16
++    int64_t group_size) {
++  const at::DeviceGuard device_guard(A.device());
++
++  TORCH_CHECK(
++      B_scale.is_contiguous(), "B_scale must be contiguous for int8 matmul");
++  TORCH_CHECK(
++      B.scalar_type() == at::ScalarType::Char,
++      "weight must be int8 (s8) for int8 matmul");
++  TORCH_CHECK(
++      A.scalar_type() == at::ScalarType::BFloat16 ||
++          A.scalar_type() == at::ScalarType::Half,
++      "input must be bfloat16 or float16 for int8 matmul");
++
++  torch::Tensor result = check_and_create_output_tensor(A, B, A.scalar_type());
++
++  oneDNN::dnnl_matmul_w8a16_int8(result, A, B, bias, B_scale, group_size);
++  return result;
++}
++
+ torch::Tensor int4_gemm_w4a8(
+     const torch::Tensor& A_,       // quantized inputs, [b, m, k]
+     const torch::Tensor& A_scale,  // [b * m, 1] or [b]
+diff --git a/csrc/xpu/ops.h b/csrc/xpu/ops.h
+index 6a30d9e..39c6870 100644
+--- a/csrc/xpu/ops.h
++++ b/csrc/xpu/ops.h
+@@ -49,6 +49,13 @@ torch::Tensor int4_gemm_w4a16(
+     int64_t group_size,
+     const std::optional<torch::Tensor>& g_idx);
+ 
++torch::Tensor int8_gemm_w8a16(
++    const torch::Tensor& A,
++    const torch::Tensor& B,
++    const std::optional<torch::Tensor>& bias,
++    const torch::Tensor& B_scale,
++    int64_t group_size);
++
+ torch::Tensor int4_gemm_w4a8(
+     const torch::Tensor& A_,
+     const torch::Tensor& A_scale,
+diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
+index 75eca16..93386b4 100644
+--- a/csrc/xpu/torch_bindings.cpp
++++ b/csrc/xpu/torch_bindings.cpp
+@@ -36,6 +36,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+       "Tensor B_zp, int group_size, Tensor? g_idx) -> Tensor");
+   xpu_ops.impl("int4_gemm_w4a16", torch::kXPU, &int4_gemm_w4a16);
+ 
++  xpu_ops.def(
++      "int8_gemm_w8a16(Tensor A, Tensor B, Tensor? bias, Tensor B_scale, "
++      "int group_size) -> Tensor");
++  xpu_ops.impl("int8_gemm_w8a16", torch::kXPU, &int8_gemm_w8a16);
++
+   xpu_ops.def(
+       "int4_gemm_w4a8(Tensor A_, Tensor A_scale, Tensor A_zp, Tensor B, "
+       "Tensor B_scale, Tensor B_zp, int group_size, Tensor? g_idx, Tensor? "

@@ -1,0 +1,43 @@
+--- a/vllm/v1/worker/mamba_utils.py	2026-08-07 13:47:44.205713362 +0000
++++ b/vllm/v1/worker/mamba_utils.py	2026-08-16 03:03:18.356039762 +0000
+@@ -23,6 +23,22 @@
+ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+ 
+ 
++def _ptr_to_i64(ptr: int) -> int:
++    """Reinterpret an unsigned 64-bit device pointer as signed int64.
++
++    On XPU, ``tensor.data_ptr()`` returns addresses in a high virtual-address
++    region whose top bit is set (e.g. ``0xffffe000ff800000``), i.e. a value
++    larger than ``int64 max``. Assigning such a value to an ``int64`` tensor
++    element raises ``ValueError: Overflow when unpacking long long``. The
++    fused mamba kernels only ever bitcast these values back to pointers
++    (``.to(tl.pointer_type(...))``), so storing the two's-complement signed
++    form is lossless and round-trips to the exact original address.
++    """
++    if ptr >= (1 << 63):
++        ptr -= 1 << 64
++    return ptr
++
++
+ @triton.jit
+ def _copy_mamba_state_block(
+     state_idx,
+@@ -652,7 +668,7 @@
+ 
+                 for state_type_idx, state in enumerate(kv_caches):
+                     # Base address
+-                    self.state_base_addrs[idx] = state.data_ptr()
++                    self.state_base_addrs[idx] = _ptr_to_i64(state.data_ptr())
+ 
+                     # Block stride (bytes between consecutive blocks)
+                     # state shape: [num_blocks, ...], stride(0) = elements per block
+@@ -735,7 +751,7 @@
+         )
+         self.block_table_stride_req = int(next(iter(strides)))
+         for i, bt in enumerate(block_tables):
+-            self.block_table_ptrs[i] = bt.data_ptr()
++            self.block_table_ptrs[i] = _ptr_to_i64(bt.data_ptr())
+ 
+         self.is_initialized = True
+ 

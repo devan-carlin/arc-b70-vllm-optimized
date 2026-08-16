@@ -1,0 +1,73 @@
+From d0dc9654a6700ba6276a81403c97b81788aff2c3 Mon Sep 17 00:00:00 2001
+From: devanscarlin-dev <devanscarlin-dev@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 21:30:35 +0000
+Subject: [PATCH 1/2] moe: add TopK=16, 32, 64 support to remap_hidden_states
+ kernel
+
+- Extend DISPATCH_TOPK_LAUNCH macro with TopK=16, 32, 64 branches
+- Enables higher num_experts_per_tok values for MoE models
+- Tested: TopK=16 already works with vllm-xpu-kernels 0.1.13.1
+- TopK=32/64 now available for testing with larger expert activation
+---
+ csrc/moe/remap_hidden_states.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+ mode change 100644 => 100755 csrc/moe/remap_hidden_states.cpp
+
+diff --git a/csrc/moe/remap_hidden_states.cpp b/csrc/moe/remap_hidden_states.cpp
+old mode 100644
+new mode 100755
+index c43dcec..859e784
+--- a/csrc/moe/remap_hidden_states.cpp
++++ b/csrc/moe/remap_hidden_states.cpp
+@@ -530,6 +530,12 @@ void remap_hidden_states(
+     LAUNCH_REMAP_HIDDEN_STATES(TA, TS, 8);              \
+   } else if (TopK == 10) {                              \
+     LAUNCH_REMAP_HIDDEN_STATES(TA, TS, 10);             \
++  } else if (TopK == 16) {                              \
++    LAUNCH_REMAP_HIDDEN_STATES(TA, TS, 16);             \
++  } else if (TopK == 32) {                              \
++    LAUNCH_REMAP_HIDDEN_STATES(TA, TS, 32);             \
++  } else if (TopK == 64) {                              \
++    LAUNCH_REMAP_HIDDEN_STATES(TA, TS, 64);             \
+   } else {                                              \
+     throw std::runtime_error("Unsupported TopK value"); \
+   }
+-- 
+2.53.0
+
+
+From 828a80a54455f2d6e636ce66c55a7e0a06d6914b Mon Sep 17 00:00:00 2001
+From: devanscarlin-dev <devanscarlin-dev@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 23:45:38 +0000
+Subject: [PATCH 2/2] fix(moe): add TopK=16,32,64 support to moe_gather kernel
+ dispatch
+
+The moe_gather kernel (final aggregation step) had its own TopK dispatch
+table limited to [1,2,4,6,7,8,10]. Added CASE_TOPK branches for 16, 32, 64
+to match the remap_hidden_states.cpp patch.
+
+Both remap_hidden_states and moe_gather now support TopK up to 64.
+---
+ csrc/moe/moe_gather.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+ mode change 100644 => 100755 csrc/moe/moe_gather.cpp
+
+diff --git a/csrc/moe/moe_gather.cpp b/csrc/moe/moe_gather.cpp
+old mode 100644
+new mode 100755
+index 1a0275d..6fdcab7
+--- a/csrc/moe/moe_gather.cpp
++++ b/csrc/moe/moe_gather.cpp
+@@ -138,6 +138,9 @@ void MoeGatherLauncher(
+       CASE_TOPK(7, ElemsPerItem)                                               \
+       CASE_TOPK(8, ElemsPerItem)                                               \
+       CASE_TOPK(10, ElemsPerItem)                                              \
++      CASE_TOPK(16, ElemsPerItem)                                              \
++      CASE_TOPK(32, ElemsPerItem)                                              \
++      CASE_TOPK(64, ElemsPerItem)                                              \
+       default:                                                                 \
+         TORCH_CHECK(false, "error: not support TOPK=" + std::to_string(TOPK)); \
+     }                                                                          \
+-- 
+2.53.0
+
