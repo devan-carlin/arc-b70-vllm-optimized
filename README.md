@@ -18,6 +18,7 @@ vLLM main (XPU), vllm-xpu-kernels main.
 | `patches/moe-topk-16-32-64.patch` | MoE TopK=16/32/64 support in the XPU MoE kernels |
 | `patches/mamba-xpu-ptr.patch` | Fix XPU pointer overflow in the mamba/GDN state bookkeeping |
 | `docs/int8-w8a16-kernel-gap.md` | Full analysis of the INT8 W8A16 kernel gap + the fix |
+| `docs/patch-*.md` | Per-patch analysis + implementation notes (one doc per patch) |
 
 ## Quick start
 
@@ -63,7 +64,9 @@ W8A16 recipe — failed at model init. This adds a oneDNN-backed
 `int8_gemm_w8a16` primitive (bf16/fp16 activations x s8 weights, symmetric
 group-quant) plus the `XPUw8a16IntLinearKernel` Python wrapper. oneDNN 3.13
 supports bf16 x s8 matmul on Xe2; the kernel just wasn't wired up. Full
-analysis in `docs/int8-w8a16-kernel-gap.md`.
+analysis in `docs/int8-w8a16-kernel-gap.md`; per-patch details in
+`docs/patch-int8-w8a16-kernels.md` (C++) and `docs/patch-int8-w8a16-vllm.md`
+(Python).
 
 Apply to a vllm + vllm-xpu-kernels source tree:
 
@@ -78,6 +81,7 @@ cd ../vllm && git apply ../patches/int8-w8a16-vllm.patch
 The XPU MoE kernels only dispatched TopK=8. Qwen3.6-35B-A3B and similar MoE
 models can run at TopK=16/32/64 (more active experts, better quality). This
 adds the missing dispatch cases to `remap_hidden_states` and `moe_gather`.
+Details and benchmark numbers in `docs/patch-moe-topk-16-32-64.md`.
 
 ### Mamba XPU pointer fix (`patches/mamba-xpu-ptr.patch`)
 
@@ -86,7 +90,8 @@ region whose top bit is set — larger than int64 max. Storing them in an
 int64 tensor raised `Overflow when unpacking long long`, breaking any model
 with mamba/GDN linear-attention layers (Qwen3.5/3.6/3.8 hybrid attention).
 The fix reinterprets the pointer as two's-complement signed int64, which is
-lossless because the kernels only ever bitcast it back to a pointer.
+lossless because the kernels only ever bitcast it back to a pointer. Details
+in `docs/patch-mamba-xpu-ptr.md`.
 
 ## Power tuning
 
