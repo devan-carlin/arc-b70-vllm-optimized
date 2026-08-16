@@ -32,15 +32,26 @@ New `XPUw8a16IntLinearKernel(MPLinearKernel)`:
 **`process_weights_after_loading`** — one-time transform after load:
 
 - `weight_packed` is `[N, K/4]` int32 (4 int8 per i32, little-endian).
-  Bitcast, no memory growth:
+  **Each byte stores `int8_value + 128`** (the `uint8b128` offset
+  convention), so unpacking subtracts the offset — a plain two's-complement
+  bitcast is wrong for every byte >= 128:
 
   ```python
-  w_i8 = w_packed.view(torch.uint8).view(torch.int8)  # [N, K] int8
+  w_u8 = w_packed.view(torch.uint8)  # [N, K] uint8, each = int8_value + 128
+  w_i8 = (w_u8.to(torch.int16) - 128).to(torch.int8)  # [N, K] int8
   layer.weight_packed.data = w_i8
   ```
 
-  Kept n-major so that `.t()` in `apply_weights` yields `[K, N]` with k
-  contiguous (what the C++ kernel expects for `trans_type_t::nt`).
+  No memory growth. Kept n-major so that `.t()` in `apply_weights` yields
+  `[K, N]` with k contiguous (what the C++ kernel expects for
+  `trans_type_t::nt`).
+
+  **Why this matters (found during bring-up)**: with the bitcast, the model
+  loaded and ran but looped on a single byte-level BPE token (empty output).
+  The scales matched the base bf16 per-group absmax exactly, proving the
+  quantization was faithful — only the value unpacking was wrong. Verified
+  against the base bf16 weights: offset unpack corr +1.00000, bitcast
+  corr -0.59.
 - `weight_scale` is `[N, K/group_size]` -> transposed to
   `[K/group_size, N]` contiguous (the layout the C++ scale attribute
   expects).

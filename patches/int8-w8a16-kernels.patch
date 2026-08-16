@@ -1,9 +1,9 @@
 diff --git a/csrc/xpu/onednn/int8_gemm_w8a16.h b/csrc/xpu/onednn/int8_gemm_w8a16.h
 new file mode 100644
-index 0000000..4591c65
+index 0000000..0c40850
 --- /dev/null
 +++ b/csrc/xpu/onednn/int8_gemm_w8a16.h
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,141 @@
 +#pragma once
 +
 +#include <c10/xpu/XPUStream.h>
@@ -85,6 +85,14 @@ index 0000000..4591c65
 +        /* mask */ (1 << 0) + (1 << 1),
 +        {group_size, 1},
 +        get_onednn_dtype(m2_sc));
++    // oneDNN requires fpmath_mode with apply_to_int=true for integral (s8)
++    // weights carrying a K-dimension scale mask (group quant). Without it,
++    // matmul_pd.hpp::attr_scales_ok rejects the K-mask as "unsupported scales
++    // configuration". Mirrors the proven int4 kernel.
++    pattr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
++    if (in_dtype == at::ScalarType::BFloat16) {
++      pattr.set_fpmath_mode(dnnl::fpmath_mode::bf16, true);
++    }
 +  };
 +
 +  // ************************************************************

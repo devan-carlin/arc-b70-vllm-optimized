@@ -1,7 +1,7 @@
 # XPU INT8 W8A16 Kernel Gap — Analysis & Fix Plan
 
 > **Date**: 2026-08-16
-> **Status**: Implemented in a clean test venv (bleeding-edge components); build + model test in progress
+> **Status**: DONE — model loads, generates correct text, benchmarked on 2x B70
 > **Trigger**: `lued/Qwen3.8-27B-INT8-W8A16-MTP` fails to load on the B70 XPU stack
 
 ## TL;DR
@@ -89,7 +89,9 @@ vllm-xpu-kernels `13013c5` (main). Test venv: `.venv-int8-test`
    each), no zero points. Weight passed as `[k, n]` with k contiguous
    (`trans_type_t::nt`). Scales set with
    `pattr.set_scales(DNNL_ARG_WEIGHTS, mask (1<<0)+(1<<1), {group_size, 1}, bf16)`
-   — group quant along k, per-channel along n.
+   — group quant along k, per-channel along n. Also sets
+   `set_fpmath_mode(f16/bf16, /*apply_to_int=*/true)` — required by oneDNN
+   for integral weights with a K-dim scale mask (see below).
 3. **`onednn_matmul.cpp`**: `int8_gemm_w8a16()` wrapper (dtype checks: B must
    be s8, A must be bf16/fp16).
 4. **`torch_bindings.cpp`**: registered
@@ -101,10 +103,11 @@ vllm-xpu-kernels `13013c5` (main). Test venv: `.venv-int8-test`
 6. **`mixed_precision/xpu.py`**: new `XPUw8a16IntLinearKernel(MPLinearKernel)`.
    - `can_implement`: `weight_type == uint8b128`, bf16/fp16 act, symmetric,
      no g_idx, group_size % 32 == 0, in/out % 32 == 0.
-   - `process_weights_after_loading`: bitcast `weight_packed`
-     `[N, K/4]` int32 → `[N, K]` int8 via `.view(torch.uint8).view(torch.int8)`
-     (little-endian, 4 int8 per i32 — no memory growth); transpose
-     `weight_scale` `[N, K/128]` → `[K/128, N]`.
+   - `process_weights_after_loading`: unpack `weight_packed`
+     `[N, K/4]` int32 → `[N, K]` int8 via
+     `(w_packed.view(torch.uint8).to(torch.int16) - 128).to(torch.int8)`
+     (the `uint8b128` +128 offset convention; little-endian, 4 int8 per i32,
+     no memory growth); transpose `weight_scale` `[N, K/128]` → `[K/128, N]`.
    - `apply_weights`: `torch.ops._xpu_C.int8_gemm_w8a16(reshaped_x, w_q.t(), bias, w_s, group_size)`.
 7. **`linear/__init__.py`**: import + add to
    `_POSSIBLE_KERNELS[PlatformEnum.XPU]` (after `XPUwNa16LinearKernel`) + `__all__`.
@@ -114,26 +117,67 @@ vllm-xpu-kernels `13013c5` (main). Test venv: `.venv-int8-test`
 - `weight_packed` `[N, K/4]` int32, **little-endian** byte order (byte 0 =
   first int8 of the group). Example `in_proj_qkv`: `[10240, 1280]` → N=10240,
   K=5120.
-- `weight_scale` `[N, K/128]` bf16, symmetric (no zero points).
+- **Each byte stores `int8_value + 128`** (the `uint8b128` offset
+  convention), NOT raw two's-complement int8. Unpacking is
+  `w_packed.view(torch.uint8).to(torch.int16).sub_(128).to(torch.int8)`.
+  A plain `.view(torch.uint8).view(torch.int8)` bitcast silently corrupts
+  every byte >= 128 (verified: corr -0.59 vs base bf16 with the bitcast,
+  corr +1.00000 with the offset subtracted).
+- `weight_scale` `[N, K/128]` bf16, symmetric (no zero points). Scales match
+  the base bf16 per-group absmax / 127 exactly — the quantization itself is
+  faithful.
 - The int4 kernel's scale pattern (`{group_size, 1}`) is the correct one for
   this layout — NOT the fp8 kernel's 2D block-quant pattern
   (`{blk_group_size, blk_group_size}`), which assumes a `[k/g, n/g]` scale.
 
-### Risk
+### oneDNN fpmath requirement (found during bring-up)
 
-oneDNN's bf16×s8 group-scaled matmul on Xe2 (Battlemage) is a standard
-primitive (confirmed in oneDNN 3.13 `src/gpu/intel/matmul/ref.hpp`:
-`is_bf16 = src_dt_==bf16 && one_of(wei_dt_, bf16,s8,u8,s4,u4)`), but is
-untested in this codebase. The int4 path's `fpmath_mode` tricks were not
-carried over (not needed for s8 weights).
+oneDNN's bf16×s8 group-scaled matmul works on Xe2, but
+`matmul_pd.hpp::attr_scales_ok` requires `fpmath_mode` with
+`apply_to_int=true` for integral weights carrying a K-dimension scale mask
+(group quant). Without it the descriptor is rejected with "unsupported
+scales configuration". The int4 kernel already set this; the int8 kernel had
+to add it too:
 
-## Test plan
+```cpp
+pattr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
+if (in_dtype == at::ScalarType::BFloat16)
+  pattr.set_fpmath_mode(dnnl::fpmath_mode::bf16, true);
+```
 
-- Clean venv, bleeding-edge vLLM XPU fork + oneDPI/oneDNN + SYCL
-- Build vllm-xpu-kernels with the patch
-- Load `lued-Qwen3.8-27B-INT8-W8A16-MTP` TP=2 on GPUs 0,1
-- Smoke test: 17×23=391, then a longer generation
-- Compare decode throughput vs the INT4 AutoRound model (52.2 tok/s baseline)
+The engine that handles this descriptor is `jit:gemm:any`
+(`src/gpu/intel/gemm/jit.hpp`, `wei_decomp()` accepts s8 weights).
+
+## Results (2026-08-16)
+
+Test venv `.venv-int8-test`: vLLM `83f591d`, vllm-xpu-kernels `13013c5` +
+patch, torch `2.13.0+xpu`, oneAPI 2026.1.0, 2x Arc Pro B70 (TP=2).
+
+- **Kernel**: standalone repro (`repro-int8-gemm.py`) passes; numerical check
+  vs CPU dequant reference on real checkpoint weights: corr 0.999996,
+  mean rel diff 1.0% (bf16 rounding).
+- **Model**: `lued-Qwen3.8-27B-INT8-W8A16-MTP` loads (14.62 GiB/GPU),
+  generates correct text. Smoke test "17 * 23" → `\n\n391` + EOS, identical
+  to the base bf16 model (TP=4) and the INT4 AutoRound model (TP=2).
+- **Decode throughput** (512 tokens, chat template, enforce_eager, TP=2,
+  same venv, same prompt):
+
+  | Model | Total tok/s (incl. prefill) |
+  |-------|-----------------------------|
+  | INT8 W8A16 (lued) | **10.30** |
+  | INT4 AutoRound (w4g128) | 9.23 |
+
+  INT8 is ~12% faster than INT4 under identical conditions. Both are far
+  below the 48 tok/s INT4 TP=4 number from the main venv (0.26.1rc1,
+  cudagraph enabled) — the test venv is bleeding-edge dev with
+  enforce_eager, so treat this as a relative comparison only. Note: the
+  custom op has no FakeTensor registration, so the torch.compile / cudagraph
+  path fails at memory profiling — enforce_eager is required until a fake
+  impl is added.
+- **Two bugs found during bring-up** (both fixed, both in the patch):
+  1. oneDNN `fpmath_mode` missing (C++ kernel) — descriptor rejected.
+  2. `uint8b128` +128 offset not applied when unpacking (Python kernel) —
+     model looped on a single byte-level BPE token, empty output.
 
 ## Why INT8 W8A16 matters
 

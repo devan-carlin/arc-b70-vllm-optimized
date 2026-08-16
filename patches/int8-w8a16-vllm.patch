@@ -27,10 +27,10 @@ index 3413d4a..d98a125 100644
      "init_mxfp8_linear_kernel",
      "Mxfp8LinearKernel",
 diff --git a/vllm/model_executor/kernels/linear/mixed_precision/xpu.py b/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
-index 17900c7..5c94df8 100644
+index 17900c7..255df11 100644
 --- a/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
 +++ b/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
-@@ -229,3 +229,76 @@ class XPUW4A8IntLinearKernel(MPLinearKernel):
+@@ -229,3 +229,82 @@ class XPUW4A8IntLinearKernel(MPLinearKernel):
          )
  
          return out.to(x.dtype)
@@ -81,10 +81,16 @@ index 17900c7..5c94df8 100644
 +
 +    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 +        # weight_packed is [N, K/4] int32 (4 int8 per i32, little-endian).
-+        # Bitcast to int8 -> [N, K] (k contiguous), keep n-major so that
++        # The checkpoint uses the compressed-tensors uint8b128 convention: each
++        # byte stores (int8_value + 128), i.e. a +128 offset, NOT raw
++        # two's-complement int8. So view as uint8 and subtract 128 to recover the
++        # signed int8 values. (A plain .view(torch.int8) reinterpretation is
++        # wrong for any byte >= 128 and silently corrupts the weights.)
++        # Result is [N, K] with k contiguous; keep n-major so that
 +        # weight_packed.t() in apply_weights yields [K, N] with k contiguous.
 +        w_packed = layer.weight_packed.data  # [N, K/4] int32
-+        w_i8 = w_packed.view(torch.uint8).view(torch.int8)  # [N, K] int8
++        w_u8 = w_packed.view(torch.uint8)  # [N, K] uint8, each = int8_value + 128
++        w_i8 = (w_u8.to(torch.int16) - 128).to(torch.int8)  # [N, K] int8
 +        layer.weight_packed.data = w_i8
 +
 +        # weight_scale is [N, K/group_size] -> transpose to [K/group_size, N].
