@@ -1,36 +1,6 @@
-diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
-index 3413d4a..d98a125 100644
---- a/vllm/model_executor/kernels/linear/__init__.py
-+++ b/vllm/model_executor/kernels/linear/__init__.py
-@@ -65,6 +65,7 @@ from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
- )
- from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
-     XPUW4A8IntLinearKernel,
-+    XPUw8a16IntLinearKernel,
-     XPUwNa16LinearKernel,
- )
- from vllm.model_executor.kernels.linear.mixed_precision.zentorch import (
-@@ -492,6 +493,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
-     PlatformEnum.XPU: [
-         XPUW4A8IntLinearKernel,
-         XPUwNa16LinearKernel,
-+        XPUw8a16IntLinearKernel,
-     ],
-     PlatformEnum.CPU: [
-         Dynamic4bitLinearKernel,
-@@ -1198,6 +1200,7 @@ __all__ = [
-     "MarlinLinearKernel",
-     "TritonW4A16LinearKernel",
-     "XPUW4A8IntLinearKernel",
-+    "XPUw8a16IntLinearKernel",
-     "XPUwNa16LinearKernel",
-     "init_mxfp8_linear_kernel",
-     "Mxfp8LinearKernel",
-diff --git a/vllm/model_executor/kernels/linear/mixed_precision/xpu.py b/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
-index 17900c7..255df11 100644
 --- a/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
 +++ b/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
-@@ -229,3 +229,82 @@ class XPUW4A8IntLinearKernel(MPLinearKernel):
+@@ -229,3 +229,82 @@
          )
  
          return out.to(x.dtype)
@@ -113,3 +83,55 @@ index 17900c7..255df11 100644
 +            self.config.group_size,
 +        )
 +        return out
+--- a/vllm/model_executor/kernels/linear/__init__.py
++++ b/vllm/model_executor/kernels/linear/__init__.py
+@@ -65,6 +65,7 @@
+ )
+ from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
+     XPUW4A8IntLinearKernel,
++    XPUw8a16IntLinearKernel,
+     XPUwNa16LinearKernel,
+ )
+ from vllm.model_executor.kernels.linear.mixed_precision.zentorch import (
+@@ -465,6 +466,7 @@
+     ],
+     PlatformEnum.XPU: [
+         XPUW4A8IntLinearKernel,
++        XPUw8a16IntLinearKernel,
+         XPUwNa16LinearKernel,
+     ],
+     PlatformEnum.CPU: [
+@@ -1169,6 +1171,7 @@
+     "MarlinLinearKernel",
+     "TritonW4A16LinearKernel",
+     "XPUW4A8IntLinearKernel",
++    "XPUw8a16IntLinearKernel",
+     "XPUwNa16LinearKernel",
+     "init_mxfp8_linear_kernel",
+     "Mxfp8LinearKernel",
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -112,6 +112,23 @@
+         return torch.empty((M, N), dtype=input.dtype, device=input.device)
+ 
+ 
++if hasattr(torch.ops._xpu_C, "int8_gemm_w8a16"):
++
++    @register_fake("_xpu_C::int8_gemm_w8a16")
++    def _int8_gemm_w8a16_fake(
++        input: torch.Tensor,
++        q_weight: torch.Tensor,
++        bias: torch.Tensor | None,
++        weight_scale: torch.Tensor,
++        group_size: int,
++    ) -> torch.Tensor:
++        # q_weight is [K, N] int8 (transposed [N, K] weight).
++        input_2d = input.view(-1, input.shape[-1])
++        M = input_2d.size(0)
++        N = q_weight.size(1)
++        return torch.empty((M, N), dtype=input.dtype, device=input.device)
++
++
+ def _gdn_attention_core_xpu_impl(
+     core_attn_out: torch.Tensor,
+     z: torch.Tensor,

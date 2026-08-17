@@ -14,10 +14,12 @@ vLLM main (XPU), vllm-xpu-kernels main.
 | `scripts/build-vllm-xpu.sh` | End-to-end build: torch XPU, vllm + vllm-xpu-kernels from source, patches applied, triton-xpu enforced |
 | `scripts/serve.sh` | Launch script with the tuned B70 flags (XPU graph, fp8 KV, block-size 32, batched-tokens 16384, ...) |
 | `scripts/setup-gpu-power-limits.sh` | Power/frequency caps via sysfs + systemd persistence (160W sweet spot) |
+| `scripts/quantize-w8a16.py` | RTN W8A16 (group-128) quantizer — bf16 → compressed-tensors INT8 checkpoint |
 | `patches/int8-w8a16-*.patch` | New INT8 W8A16 linear kernel (C++/SYCL + Python) — see `docs/int8-w8a16-kernel-gap.md` |
 | `patches/moe-topk-16-32-64.patch` | MoE TopK=16/32/64 support in the XPU MoE kernels |
 | `patches/mamba-xpu-ptr.patch` | Fix XPU pointer overflow in the mamba/GDN state bookkeeping |
 | `docs/int8-w8a16-kernel-gap.md` | Full analysis of the INT8 W8A16 kernel gap + the fix |
+| `docs/int8-w8a16-quantization.md` | How to make an INT8 W8A16 checkpoint (the quantizer + config gotchas) |
 | `docs/patch-*.md` | Per-patch analysis + implementation notes (one doc per patch) |
 
 ## Quick start
@@ -92,6 +94,23 @@ with mamba/GDN linear-attention layers (Qwen3.5/3.6/3.8 hybrid attention).
 The fix reinterprets the pointer as two's-complement signed int64, which is
 lossless because the kernels only ever bitcast it back to a pointer. Details
 in `docs/patch-mamba-xpu-ptr.md`.
+
+## Quantizing a model to INT8 W8A16
+
+`scripts/quantize-w8a16.py` is a self-contained RTN (round-to-nearest)
+quantizer — no AutoRound, no llm-compressor, no calibration data. It reads a
+bf16 safetensors model and writes a compressed-tensors `pack-quantized`
+checkpoint the patched path loads directly:
+
+```bash
+python scripts/quantize-w8a16.py /path/to/bf16-model /path/to/int8-model
+```
+
+It handles the three qwen3_5 config gotchas that otherwise break loading
+(mandatory `quant_method`, the construction-prefix ignore regex, and the
+fused `in_proj_ba` shard-name ignore). Verified: 27B bf16 (52 GB) → 31.6 GB
+INT8, 47.8 tok/s decode at TP=4 with XPU graph — matching the INT4 AutoRound
+baseline. Full details in `docs/int8-w8a16-quantization.md`.
 
 ## Power tuning
 

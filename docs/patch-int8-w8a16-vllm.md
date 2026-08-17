@@ -1,6 +1,11 @@
 # Patch: INT8 W8A16 vLLM kernel registration (`patches/int8-w8a16-vllm.patch`)
 
-Target: `vllm` (Python). 2 files, ~109 lines.
+Target: `vllm` (Python). 3 files, 137 lines.
+
+Re-cut 2026-08-17 against `vllm` `c39076fef`. The re-cut adds the
+`vllm/_xpu_ops.py` FakeTensor registration (item 3 below), which the original
+patch was missing — without it cudagraph capture fails and decode runs at
+~19.6 tok/s instead of ~47.8.
 
 ## Problem
 
@@ -77,6 +82,33 @@ out = torch.ops._xpu_C.int8_gemm_w8a16(
   their own weight types; this kernel only claims `uint8b128`).
 - Add to `__all__`.
 
+### 3. `vllm/_xpu_ops.py`
+
+Registers a FakeTensor (fake) impl for `_xpu_C::int8_gemm_w8a16`:
+
+```python
+if hasattr(torch.ops._xpu_C, "int8_gemm_w8a16"):
+
+    @register_fake("_xpu_C::int8_gemm_w8a16")
+    def _int8_gemm_w8a16_fake(
+        input: torch.Tensor,
+        q_weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        weight_scale: torch.Tensor,
+        group_size: int,
+    ) -> torch.Tensor:
+        input_2d = input.view(-1, input.shape[-1])
+        M = input_2d.size(0)
+        N = q_weight.size(1)
+        return torch.empty((M, N), dtype=input.dtype, device=input.device)
+```
+
+This is what lets the torch.compile memory-profiling pass succeed during XPU
+cudagraph capture. Without it, capture aborts with
+`UnsupportedOperatorException` and vLLM falls back to eager — the difference
+between 47.8 and 19.6 tok/s at TP=4. The `hasattr` guard means it is a no-op
+when the kernel op is not built in.
+
 ## Apply
 
 ```bash
@@ -85,7 +117,8 @@ git apply ../patches/int8-w8a16-vllm.patch
 ```
 
 No rebuild needed for the Python side; the vllm package just needs to be
-(re)installed or the tree used in place.
+(re)installed or the tree used in place. All three files are Python — the
+`_xpu_ops.py` change is picked up on import.
 
 ## Verify
 

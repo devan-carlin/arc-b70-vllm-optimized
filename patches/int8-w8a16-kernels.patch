@@ -146,19 +146,21 @@ index 0000000..0c40850
 +}
 +}  // namespace oneDNN
 diff --git a/csrc/xpu/onednn/onednn_ext.h b/csrc/xpu/onednn/onednn_ext.h
-index 9a29844..4bc0fab 100644
+old mode 100644
+new mode 100755
+index 9a29844..24d721b
 --- a/csrc/xpu/onednn/onednn_ext.h
 +++ b/csrc/xpu/onednn/onednn_ext.h
-@@ -53,6 +53,8 @@ enum class joint_dtypes_t {
-   f8_e4m3_bf16,
-   mxfp4_bf16,
-   mxfp4_f16,
+@@ -41,6 +41,8 @@ enum class joint_dtypes_t {
+   int8,
+   f16_int4,
+   bf16_int4,
 +  f16_int8,
 +  bf16_int8,
- };
- 
- template <joint_dtypes_t Ts>
-@@ -220,6 +222,28 @@ struct onednn_types_mapper<joint_dtypes_t::mxfp4_f16> {
+   s8_int4,
+   u8_int4,
+   f16_f8_e5m2,
+@@ -80,6 +82,28 @@ struct onednn_types_mapper<joint_dtypes_t::bf16_int4> {
    }
  };
  
@@ -184,10 +186,10 @@ index 9a29844..4bc0fab 100644
 +  }
 +};
 +
- static inline memory::data_type
- get_onednn_dtype(const at::Tensor& tensor, bool allow_undef = false) {
-   switch (tensor.scalar_type()) {
-@@ -1168,6 +1192,36 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
+ template <>
+ struct onednn_types_mapper<joint_dtypes_t::s8_int4> {
+   static inline std::
+@@ -988,6 +1012,36 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
            scale_group_size,
            zp_group_size,
            batch_dim);
@@ -221,11 +223,13 @@ index 9a29844..4bc0fab 100644
 +          scale_group_size,
 +          zp_group_size,
 +          batch_dim);
-     default:
-       throw std::runtime_error("Only support int4 and fp8 gemm ...");
-   }
+     case joint_dtypes_t::s8_int4:
+       return matmul_primitive_create_and_cache<joint_dtypes_t::s8_int4, F>(
+           Tt,
 diff --git a/csrc/xpu/onednn/onednn_matmul.cpp b/csrc/xpu/onednn/onednn_matmul.cpp
-index 734308a..28dfc5b 100644
+old mode 100644
+new mode 100755
+index 734308a..28dfc5b
 --- a/csrc/xpu/onednn/onednn_matmul.cpp
 +++ b/csrc/xpu/onednn/onednn_matmul.cpp
 @@ -4,6 +4,7 @@
@@ -268,7 +272,9 @@ index 734308a..28dfc5b 100644
      const torch::Tensor& A_,       // quantized inputs, [b, m, k]
      const torch::Tensor& A_scale,  // [b * m, 1] or [b]
 diff --git a/csrc/xpu/ops.h b/csrc/xpu/ops.h
-index 6a30d9e..39c6870 100644
+old mode 100644
+new mode 100755
+index 6a30d9e..39c6870
 --- a/csrc/xpu/ops.h
 +++ b/csrc/xpu/ops.h
 @@ -49,6 +49,13 @@ torch::Tensor int4_gemm_w4a16(
@@ -286,7 +292,9 @@ index 6a30d9e..39c6870 100644
      const torch::Tensor& A_,
      const torch::Tensor& A_scale,
 diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
-index 75eca16..93386b4 100644
+old mode 100644
+new mode 100755
+index 75eca16..93386b4
 --- a/csrc/xpu/torch_bindings.cpp
 +++ b/csrc/xpu/torch_bindings.cpp
 @@ -36,6 +36,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {

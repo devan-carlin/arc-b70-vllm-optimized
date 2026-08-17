@@ -1,6 +1,10 @@
 # Patch: INT8 W8A16 kernels (`patches/int8-w8a16-kernels.patch`)
 
-Target: `vllm-xpu-kernels` (C++/SYCL, oneDNN backend). 5 files, ~295 lines.
+Target: `vllm-xpu-kernels` (C++/SYCL, oneDNN backend). 5 files, 232 insertions.
+
+Re-cut 2026-08-17 against `vllm-xpu-kernels` `828a80a` (the patch originally
+cut against an earlier tree no longer applied once upstream added the `mxfp4_*`
+`joint_dtypes_t` entries above the `onednn_ext.h` hunk).
 
 ## Problem
 
@@ -155,12 +159,15 @@ print([n for n in dir(C) if "int8" in n])  # expect int8_gemm_w8a16
 - Decode: 10.30 tok/s (512 tokens, enforce_eager, TP=2) vs 9.23 tok/s for
   INT4 AutoRound under identical conditions.
 
-## Known limitations
+## Cudagraph / FakeTensor
 
-- No FakeTensor (fake) registration for `int8_gemm_w8a16` — the
-  torch.compile / cudagraph path fails at memory profiling with
-  `UnsupportedOperatorException`. `enforce_eager=True` is required until a
-  fake impl is added (the int4 op has the same gap).
+The C++ op has no FakeTensor (fake) registration, so the torch.compile
+memory-profiling pass during cudagraph capture fails with
+`UnsupportedOperatorException` unless a fake impl is registered on the Python
+side. That impl now ships in `patches/int8-w8a16-vllm.patch`
+(`vllm/_xpu_ops.py`) — with it, XPU graph capture works and decode reaches the
+full ~48 tok/s tier (see the vllm patch doc). Without it, `enforce_eager=True`
+is required and decode drops to ~19.6 tok/s.
 
 ## Related
 
